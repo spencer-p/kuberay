@@ -3,8 +3,14 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
+
+	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
+	"k8s.io/client-go/rest"
 
 	"github.com/go-logr/zapr"
 	routev1 "github.com/openshift/api/route/v1"
@@ -19,6 +25,8 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/component-base/metrics/legacyregistry"
+	_ "k8s.io/component-base/metrics/prometheus/clientgo"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -204,6 +212,17 @@ func main() {
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: config.MetricsAddr,
+			FilterProvider: func(c *rest.Config, httpClient *http.Client) (metricsserver.Filter, error) {
+				return func(log logr.Logger, handler http.Handler) (http.Handler, error) {
+					return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if r.URL.Path == "/metrics" {
+							promhttp.HandlerFor(FilteringGatherer{}, promhttp.HandlerOpts{}).ServeHTTP(w, r)
+							return
+						}
+						handler.ServeHTTP(w, r)
+					}), nil
+				}, nil
+			},
 		},
 		HealthProbeBindAddress:  config.ProbeAddr,
 		LeaderElection:          *config.EnableLeaderElection,
@@ -360,4 +379,39 @@ func newLogEncoder(encoderType string) (zapcore.Encoder, error) {
 	}
 
 	return nil, fmt.Errorf("invalid encoder %q (must be 'json' or 'console')", encoderType)
+}
+
+// FilteringGatherer gathers metrics from both controller-runtime and legacyregistry,
+// removing duplicates by keeping the first occurrence.
+type FilteringGatherer struct{}
+
+// Gather implements the prometheus.Gatherer interface.
+func (g FilteringGatherer) Gather() ([]*dto.MetricFamily, error) {
+	mfs1, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		return nil, err
+	}
+	mfs2, err := legacyregistry.DefaultGatherer.Gather()
+	if err != nil {
+		return nil, err
+	}
+
+	var filtered []*dto.MetricFamily
+	seen := make(map[string]bool)
+
+	for _, mf := range mfs1 {
+		name := mf.GetName()
+		seen[name] = true
+		filtered = append(filtered, mf)
+	}
+
+	for _, mf := range mfs2 {
+		name := mf.GetName()
+		if !seen[name] {
+			seen[name] = true
+			filtered = append(filtered, mf)
+		}
+	}
+
+	return filtered, nil
 }
